@@ -11,32 +11,17 @@ A ROS 2 node for Depth Anything V3 depth estimation using TensorRT for real-time
 - [Features](#features)
 - [Dependencies](#dependencies)
 - [Topics](#topics)
-  - [Subscribed Topics](#subscribed-topics)
-  - [Published Topics](#published-topics)
 - [Parameters](#parameters)
-  - [Model Configuration](#model-configuration)
-  - [Sky Handling](#sky-handling)
-  - [Point Cloud Configuration](#point-cloud-configuration)
-  - [Debug Configuration](#debug-configuration)
 - [Usage](#usage)
-  - [Basic Launch](#basic-launch)
-  - [With Custom Topics](#with-custom-topics)
-  - [With Debug Enabled](#with-debug-enabled)
 - [Model Preparation](#model-preparation)
 - [Docker Image](#docker-image)
 - [Building](#building)
 - [Performance](#performance)
 - [Architecture](#architecture)
 - [Depth Postprocessing Pipeline](#depth-postprocessing-pipeline)
-  - [1. Depth Extraction](#1-depth-extraction)
-  - [2. Focal Length Scaling](#2-focal-length-scaling)
-  - [3. Sky Handling](#3-sky-handling)
-  - [4. Resolution Upscaling](#4-resolution-upscaling)
-  - [5. Point Cloud Generation](#5-point-cloud-generation)
 - [Troubleshooting](#troubleshooting)
-  - [Common Issues](#common-issues)
-  - [Debug Mode](#debug-mode)
 - [License](#license)
+- [Citation](#citation)
 - [Acknowledgements](#acknowledgements)
 
 
@@ -287,6 +272,19 @@ This will publish colorized depth images and save them to disk for inspection.
 ## License
 
 This project is licensed under the Apache License, Version 2.0 - see the [LICENSE](LICENSE) file for details.
+
+## Citation
+If you use this code in your research, please cite the following paper:
+
+```bibtex
+@misc{beemelmanns2024depth,
+  author = {Till Beemelmanns},
+  title = {ros2-depth-anything-v3-trt: ROS2 TensorRT Node for Monocular Metric Depth estimation and Point Cloud generation with Depth Anything V3},
+  year = {2025},
+  publisher = {GitHub},
+  url = {https://github.com/ika-rwth-aachen/ros2-depth-anything-v3-trt}
+}
+```
 
 ## Acknowledgements
 Thanks to the following repositories for inspiration:
