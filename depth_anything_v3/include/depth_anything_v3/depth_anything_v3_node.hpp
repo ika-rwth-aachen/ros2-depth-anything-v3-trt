@@ -24,12 +24,11 @@
 #include <opencv2/opencv.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
-#include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <string>
+#include <image_transport/subscriber_filter.hpp>
 #include <message_filters/subscriber.h>
-#include <message_filters/time_synchronizer.h>
 #include <message_filters/synchronizer.h>
 #include <message_filters/sync_policies/approximate_time.h>
 
@@ -59,25 +58,25 @@ public:
   };
 
 private:
-  // Synchronized subscribers for compressed image and camera_info
-  std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::CompressedImage>> sub_compressed_image_;
+  // Synchronized subscribers for image (via image_transport) and camera_info
+  image_transport::SubscriberFilter sub_image_;
   std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::CameraInfo>> sub_camera_info_;
   
   // Use approximate time synchronizer for more flexible timing
-  typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::CompressedImage, sensor_msgs::msg::CameraInfo> ApproxSyncPolicy;
+  typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::Image, sensor_msgs::msg::CameraInfo> ApproxSyncPolicy;
   std::shared_ptr<message_filters::Synchronizer<ApproxSyncPolicy>> sync_;
   
   // Debug subscribers (separate from sync)
-  rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr debug_image_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr debug_image_sub_;
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr debug_camera_info_sub_;
 
   // Callbacks
-  void onCompressedImageCameraInfo(
-    const sensor_msgs::msg::CompressedImage::ConstSharedPtr & image_msg,
+  void onImageCameraInfo(
+    const sensor_msgs::msg::Image::ConstSharedPtr & image_msg,
     const sensor_msgs::msg::CameraInfo::ConstSharedPtr & camera_info_msg);
     
   // Debug callbacks for individual topics
-  void onCompressedImageDebug(const sensor_msgs::msg::CompressedImage::ConstSharedPtr & msg);
+  void onImageDebug(const sensor_msgs::msg::Image::ConstSharedPtr & msg);
   void onCameraInfoDebug(const sensor_msgs::msg::CameraInfo::ConstSharedPtr & msg);
 
   // Publishers

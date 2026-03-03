@@ -31,6 +31,7 @@ find_package(rclcpp_components REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(message_filters REQUIRED)
+find_package(image_transport REQUIRED)
 find_package(OpenCV 4 REQUIRED)
 
 # Find CUDA
@@ -100,6 +101,7 @@ ament_target_dependencies(depth_anything_v3_node
   rclcpp_components
   sensor_msgs
   cv_bridge
+  image_transport
   message_filters
 )
 

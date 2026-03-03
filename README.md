@@ -57,14 +57,14 @@ Depending on your driver and CUDA version you need to select the appropriate bas
 
 ### Subscribed Topics
 
-- `~/input/image` (sensor_msgs/Image): Input camera image
-- `~/input/camera_info` (sensor_msgs/CameraInfo): Camera calibration info
+- `~/input/image` (sensor_msgs/msg/Image): Input camera image (supports raw and compressed transport via [image_transport](https://wiki.ros.org/image_transport))
+- `~/input/camera_info` (sensor_msgs/msg/CameraInfo): Camera calibration info
 
 ### Published Topics  
 
-- `~/output/depth_image` (sensor_msgs/Image): Depth image (32FC1 format)
-- `~/output/point_cloud` (sensor_msgs/PointCloud2): Generated point cloud
-- `~/output/depth_image_debug` (sensor_msgs/Image): Debug depth visualization (if enabled)
+- `~/output/depth_image` (sensor_msgs/msg/Image): Depth image (32FC1 format)
+- `~/output/point_cloud` (sensor_msgs/msg/PointCloud2): Generated point cloud
+- `~/output/depth_image_debug` (sensor_msgs/msg/Image): Debug depth visualization (if enabled)
 
 ## Parameters
 

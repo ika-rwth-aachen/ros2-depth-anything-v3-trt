@@ -81,24 +81,24 @@ DepthAnythingV3Node::DepthAnythingV3Node(const rclcpp::NodeOptions & node_option
 
   RCLCPP_INFO(get_logger(), "Using model file: %s", node_param_.onnx_path.c_str());
 
-  // Synchronized subscribers for compressed image and camera_info
-  // Use SensorDataQoS to match typical image publishers (Best Effort reliability)
-  sub_compressed_image_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::CompressedImage>>(
-    this, "~/input/image", rclcpp::SensorDataQoS().get_rmw_qos_profile());
+  // Synchronized subscribers for image (via image_transport) and camera_info
+  // image_transport supports raw and compressed transports transparently
+  const auto transport = declare_parameter<std::string>("image_transport", "raw");
+  sub_image_.subscribe(this, "~/input/image", transport, rclcpp::SensorDataQoS().get_rmw_qos_profile());
   sub_camera_info_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::CameraInfo>>(
     this, "~/input/camera_info", rclcpp::SensorDataQoS().get_rmw_qos_profile());
   
   // Use approximate time synchronizer with 100ms tolerance
   sync_ = std::make_shared<message_filters::Synchronizer<ApproxSyncPolicy>>(
-    ApproxSyncPolicy(10), *sub_compressed_image_, *sub_camera_info_);
-  sync_->registerCallback(std::bind(&DepthAnythingV3Node::onCompressedImageCameraInfo, this, _1, _2));
+    ApproxSyncPolicy(10), sub_image_, *sub_camera_info_);
+  sync_->registerCallback(std::bind(&DepthAnythingV3Node::onImageCameraInfo, this, _1, _2));
   
   RCLCPP_INFO(get_logger(), "Using ApproximateTime synchronizer with queue size 10");
 
   // Debug subscribers to check if individual topics are arriving
-  debug_image_sub_ = this->create_subscription<sensor_msgs::msg::CompressedImage>(
+  debug_image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
     "~/input/image", rclcpp::SensorDataQoS(),
-    std::bind(&DepthAnythingV3Node::onCompressedImageDebug, this, std::placeholders::_1));
+    std::bind(&DepthAnythingV3Node::onImageDebug, this, std::placeholders::_1));
   debug_camera_info_sub_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
     "~/input/camera_info", rclcpp::SensorDataQoS(),
     std::bind(&DepthAnythingV3Node::onCameraInfoDebug, this, std::placeholders::_1));
@@ -141,8 +141,8 @@ DepthAnythingV3Node::DepthAnythingV3Node(const rclcpp::NodeOptions & node_option
   RCLCPP_INFO(get_logger(), "Finished initializing Depth Anything V3 TensorRT model");
 }
 
-void DepthAnythingV3Node::onCompressedImageCameraInfo(
-  const sensor_msgs::msg::CompressedImage::ConstSharedPtr & image_msg,
+void DepthAnythingV3Node::onImageCameraInfo(
+  const sensor_msgs::msg::Image::ConstSharedPtr & image_msg,
   const sensor_msgs::msg::CameraInfo::ConstSharedPtr & camera_info_msg)
 {
 
@@ -316,13 +316,13 @@ int DepthAnythingV3Node::getColorMapType(const std::string& colormap_name)
   return cv::COLORMAP_JET;
 }
 
-void DepthAnythingV3Node::onCompressedImageDebug(const sensor_msgs::msg::CompressedImage::ConstSharedPtr & msg)
+void DepthAnythingV3Node::onImageDebug(const sensor_msgs::msg::Image::ConstSharedPtr & msg)
 {
   static int image_count = 0;
   image_count++;
   RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000, 
-    "[DEBUG] Received compressed image #%d, size: %zu bytes, format: %s, timestamp: %d.%09d", 
-    image_count, msg->data.size(), msg->format.c_str(), msg->header.stamp.sec, msg->header.stamp.nanosec);
+    "[DEBUG] Received image #%d, encoding: %s, size: %ux%u, timestamp: %d.%09d", 
+    image_count, msg->encoding.c_str(), msg->width, msg->height, msg->header.stamp.sec, msg->header.stamp.nanosec);
 }
 
 void DepthAnythingV3Node::onCameraInfoDebug(const sensor_msgs::msg::CameraInfo::ConstSharedPtr & msg)
