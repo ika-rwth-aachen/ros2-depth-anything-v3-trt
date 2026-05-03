@@ -55,6 +55,18 @@ def generate_launch_description():
         description='Output point cloud topic'
     )
 
+    output_image_raw_topic_arg = DeclareLaunchArgument(
+        'output_image_raw_topic',
+        default_value='/depth_anything_v3/output/image_raw',
+        description='Output synchronized raw image topic'
+    )
+    
+    output_camera_info_topic_arg = DeclareLaunchArgument(
+        'output_camera_info_topic',
+        default_value='/depth_anything_v3/output/camera_info',
+        description='Output synchronized camera info topic'
+    )
+
     # Depth Anything V3 node
     depth_anything_v3_node = Node(
         package='depth_anything_v3',
@@ -65,7 +77,9 @@ def generate_launch_description():
             ('~/input/image', LaunchConfiguration('input_image_topic')),
             ('~/input/camera_info', LaunchConfiguration('input_camera_info_topic')),
             ('~/output/depth_image', LaunchConfiguration('output_depth_topic')),
-            ('~/output/point_cloud', LaunchConfiguration('output_point_cloud_topic'))
+            ('~/output/point_cloud', LaunchConfiguration('output_point_cloud_topic')),
+            ('~/output/image_raw', LaunchConfiguration('output_image_raw_topic')),
+            ('~/output/camera_info', LaunchConfiguration('output_camera_info_topic'))
         ],
         parameters=[LaunchConfiguration('params_file')]
     )
@@ -77,6 +91,8 @@ def generate_launch_description():
         input_camera_info_topic_arg,
         output_depth_topic_arg,
         output_point_cloud_topic_arg,
+        output_image_raw_topic_arg,
+        output_camera_info_topic_arg,
         # Nodes
         depth_anything_v3_node,
     ])

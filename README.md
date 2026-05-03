@@ -101,6 +101,7 @@ All parameters can be configured via `config/depth_anything_v3.param.yaml` or pa
 | `write_colormap` | bool | `false` | Save colorized debug images to disk |
 | `debug_colormap_min_depth` | double | `0.0` | Minimum depth value for colormap normalization (meters) |
 | `debug_colormap_max_depth` | double | `50.0` | Maximum depth value for colormap normalization (meters) |
+| `republish_sync_source` | bool | `false` | Enable republishing syncronized image and camera_info with which depth has been computed  |
 
 #### Available Colormaps
 `JET`, `HOT`, `COOL`, `SPRING`, `SUMMER`, `AUTUMN`, `WINTER`, `BONE`, `GRAY`, `HSV`, `PARULA`, `PLASMA`, `INFERNO`, `VIRIDIS`, `MAGMA`, `CIVIDIS`

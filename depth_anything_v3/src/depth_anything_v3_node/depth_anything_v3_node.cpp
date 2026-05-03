@@ -74,6 +74,8 @@ DepthAnythingV3Node::DepthAnythingV3Node(const rclcpp::NodeOptions & node_option
   node_param_.debug_colormap_max_depth = declare_parameter<double>("debug_colormap_max_depth", 100.0);
   node_param_.sky_threshold = declare_parameter<double>("sky_threshold", 0.3);
   node_param_.sky_depth_cap = declare_parameter<double>("sky_depth_cap", 200.0);
+
+  node_param_.republish_sync_source = declare_parameter<bool>("republish_sync_source", false);
   
   // Point cloud parameters
   node_param_.point_cloud_downsample_factor = declare_parameter<int>("point_cloud_downsample_factor", 10);
@@ -111,12 +113,17 @@ DepthAnythingV3Node::DepthAnythingV3Node(const rclcpp::NodeOptions & node_option
   RCLCPP_INFO(get_logger(), "  - Camera info topic: ~/input/camera_info");
 
   // Publishers
-  pub_depth_image_ = create_publisher<sensor_msgs::msg::Image>("~/output/depth_image", 1);
-  pub_point_cloud_ = create_publisher<sensor_msgs::msg::PointCloud2>("~/output/point_cloud", 1);
+  pub_depth_image_ = create_publisher<sensor_msgs::msg::Image>("~/output/depth_image", 10);
+  pub_point_cloud_ = create_publisher<sensor_msgs::msg::PointCloud2>("~/output/point_cloud", 10);
   
   if (node_param_.enable_debug) {
     pub_depth_image_debug_ = create_publisher<sensor_msgs::msg::Image>(
       "~/output/depth_image_debug", 1);
+  }
+
+  if (node_param_.republish_sync_source) {
+    pub_raw_image_ = create_publisher<sensor_msgs::msg::Image>("~/output/image_raw", 10);
+    pub_camera_info_ = create_publisher<sensor_msgs::msg::CameraInfo>("~/output/camera_info", 10);
   }
 
   // Init TensorRT model
@@ -181,6 +188,9 @@ void DepthAnythingV3Node::onImageCameraInfo(
 
   RCLCPP_DEBUG(this->get_logger(), "Inference completed in %.3f ms", inference_time_sec * 1000.0);
 
+  // Get image header as common header
+  std_msgs::msg::Header common_header = image_msg->header;
+
   // Get depth image result
   const cv::Mat& depth_image = tensorrt_depth_anything_->getDepthImage();
   
@@ -188,12 +198,12 @@ void DepthAnythingV3Node::onImageCameraInfo(
   cv_bridge::CvImage cv_img_depth;
   cv_img_depth.image = depth_image;
   cv_img_depth.encoding = "32FC1";
-  cv_img_depth.header = image_msg->header;
+  cv_img_depth.header = common_header;
   pub_depth_image_->publish(*cv_img_depth.toImageMsg());
 
   // Publish point cloud
   sensor_msgs::msg::PointCloud2 point_cloud = tensorrt_depth_anything_->getPointCloud();
-  point_cloud.header = image_msg->header;
+  point_cloud.header = common_header;
   pub_point_cloud_->publish(point_cloud);
 
   // Publish debug depth image if enabled
@@ -252,6 +262,14 @@ void DepthAnythingV3Node::onImageCameraInfo(
     cv_img_debug.header = image_msg->header;
     pub_depth_image_debug_->publish(*cv_img_debug.toImageMsg());
   }
+
+  if (node_param_.republish_sync_source) {
+    pub_raw_image_->publish(*image_msg);
+    
+    sensor_msgs::msg::CameraInfo synced_camera_info = *camera_info_msg;
+    synced_camera_info.header = common_header;
+    pub_camera_info_->publish(synced_camera_info);
+  }
 }
 
 rcl_interfaces::msg::SetParametersResult DepthAnythingV3Node::onSetParam(
@@ -274,6 +292,7 @@ rcl_interfaces::msg::SetParametersResult DepthAnythingV3Node::onSetParam(
     update_param(params, "sky_depth_cap", p.sky_depth_cap);
     update_param(params, "point_cloud_downsample_factor", p.point_cloud_downsample_factor);
     update_param(params, "colorize_point_cloud", p.colorize_point_cloud);
+    update_param(params, "republish_sync_source", p.republish_sync_source);
     
     // Apply runtime-configurable model parameters
     if (tensorrt_depth_anything_) {

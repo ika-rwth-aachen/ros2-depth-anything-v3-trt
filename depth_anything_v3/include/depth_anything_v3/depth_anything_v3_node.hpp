@@ -55,6 +55,7 @@ public:
     double sky_depth_cap{};             // Cap for sky depth fill-in
     int point_cloud_downsample_factor{};  // Only publish every Nth point (1 = no downsampling)
     bool colorize_point_cloud{};  // Add RGB colors from input image to point cloud
+    bool republish_sync_source{}; // Republish source image and camera_info
   };
 
 private:
@@ -83,6 +84,8 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_depth_image_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_point_cloud_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_depth_image_debug_;
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_raw_image_;
+  rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr pub_camera_info_;
 
   // Helper methods
   int getColorMapType(const std::string& colormap_name);
