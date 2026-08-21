@@ -106,11 +106,9 @@ DepthAnythingV3Node::DepthAnythingV3Node(const rclcpp::NodeOptions & node_option
   
   RCLCPP_INFO(get_logger(), "Using ApproximateTime synchronizer with queue size 10");
 
-  // Debug subscribers to check if individual topics are arriving
-  debug_image_sub_.subscribe(
-    this, image_base_topic, image_transport,
-    rclcpp::SensorDataQoS().get_rmw_qos_profile());
-  debug_image_sub_.registerCallback(std::bind(&DepthAnythingV3Node::onImageDebug, this, _1));
+  // Debug callbacks to check if individual topics are arriving. The image one
+  // registers on sub_image_; a second subscription would decode every frame again.
+  sub_image_.registerCallback(std::bind(&DepthAnythingV3Node::onImageDebug, this, _1));
   debug_camera_info_sub_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
     resolved_camera_info_topic, rclcpp::SensorDataQoS(),
     std::bind(&DepthAnythingV3Node::onCameraInfoDebug, this, std::placeholders::_1));
@@ -171,9 +169,9 @@ void DepthAnythingV3Node::onImageCameraInfo(
   const sensor_msgs::msg::CameraInfo::ConstSharedPtr & camera_info_msg)
 {
 
-  cv_bridge::CvImagePtr in_image_ptr;
+  cv_bridge::CvImageConstPtr in_image_ptr;
   try {
-    in_image_ptr = cv_bridge::toCvCopy(image_msg, sensor_msgs::image_encodings::BGR8);
+    in_image_ptr = cv_bridge::toCvShare(image_msg, sensor_msgs::image_encodings::BGR8);
   } catch (cv_bridge::Exception & e) {
     RCLCPP_ERROR(this->get_logger(), "cv_bridge exception: %s", e.what());
     return;

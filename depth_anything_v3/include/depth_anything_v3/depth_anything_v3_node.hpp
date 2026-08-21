@@ -67,8 +67,7 @@ private:
   typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::Image, sensor_msgs::msg::CameraInfo> ApproxSyncPolicy;
   std::shared_ptr<message_filters::Synchronizer<ApproxSyncPolicy>> sync_;
   
-  // Debug subscribers (separate from sync)
-  image_transport::SubscriberFilter debug_image_sub_;
+  // Debug subscriber (separate from sync)
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr debug_camera_info_sub_;
 
   // Callbacks
