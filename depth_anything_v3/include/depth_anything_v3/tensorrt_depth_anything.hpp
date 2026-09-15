@@ -23,6 +23,7 @@
 #include <opencv2/opencv.hpp>
 #include <string>
 #include <tensorrt_common/tensorrt_common.hpp>
+#include <utility>
 #include <vector>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
@@ -39,6 +40,12 @@ void launchPreprocess(
   const uint8_t * src_bgr, int src_width, int src_height,
   float * dst_nchw, int dst_width, int dst_height, cudaStream_t stream);
 
+// Defined in preprocess_gpu.cu: write a packed (HWC, BGR8) image resized to
+// (dst_width x dst_height) so it can be used for point cloud colouring.
+void launchResizeColor(
+  const uint8_t * src_bgr, int src_width, int src_height,
+  uint8_t * dst_bgr, int dst_width, int dst_height, cudaStream_t stream);
+
 // Defined in postprocess_gpu.cu
 size_t postprocessScratchBytes(int num_pixels);
 void launchPostprocess(
@@ -47,6 +54,15 @@ void launchPostprocess(
   int out_width, int out_height,
   float * depth_out, uint8_t * mask_out, float * depth_full_out,
   void * scratch_buffer, size_t scratch_bytes, cudaStream_t stream);
+
+// Defined in postprocess_gpu.cu: build the packed (xyz) or (xyz,rgb)
+// PointCloud2 payload straight on the device from the scaled depth map.
+// out_packed has point_step 12 (xyz) or 15 (xyz + r,g,b) bytes.
+void launchBuildPointCloud(
+  const float * depth, const uint8_t * mask, const uint8_t * color_bgr,
+  int width, int height, float fx, float fy, float cx, float cy,
+  int downsample, bool with_color, uint8_t * out_packed,
+  int out_width, int out_height, cudaStream_t stream);
 
 /**
  * @class TensorRTDepthAnything
@@ -79,7 +95,9 @@ public:
    * @param[in] downsample_factor only publish every Nth point (1 = no downsampling)
    * @param[in] colorize_pointcloud whether to colorize point cloud with RGB
    */
-  bool doInference(const std::vector<cv::Mat> & images, const sensor_msgs::msg::CameraInfo & camera_info, int downsample_factor = 1, bool colorize_pointcloud = false);
+  bool doInference(
+    const std::vector<cv::Mat> & images, const sensor_msgs::msg::CameraInfo & camera_info,
+    int downsample_factor = 1, bool colorize_pointcloud = false);
 
   void initPreprocessBuffer(int width, int height);
 
@@ -92,59 +110,22 @@ public:
    * @brief Get the depth image result
    * @return depth image as cv::Mat (const reference)
    */
-  const cv::Mat& getDepthImage() const;
+  const cv::Mat & getDepthImage() const;
 
   /**
    * @brief Get the point cloud result
    * @return point cloud as ROS2 PointCloud2 message (const reference)
    */
-  const sensor_msgs::msg::PointCloud2& getPointCloud() const;
+  const sensor_msgs::msg::PointCloud2 & getPointCloud() const;
 
-private:
-  /**
-   * @brief run preprocess including resizing, NHWC2NCHW and toFloat on GPU
-   * @param[in] images batching images
-   */
-  void preprocess(const std::vector<cv::Mat> & images);
-
-  /**
-   * @brief perform TensorRT inference
-   */
-  bool infer();
-
-  /**
-   * @brief postprocess inference results to generate depth and point cloud
-   * @param[in] camera_info camera calibration for point cloud generation
-   * @param[in] downsample_factor downsampling factor for point cloud
-   * @param[in] rgb_image optional RGB image for colorizing point cloud
-   */
-  void postprocess(const sensor_msgs::msg::CameraInfo & camera_info, int downsample_factor = 1, const cv::Mat & rgb_image = cv::Mat());
-
-  /**
-   * @brief (re)allocate the postprocessing buffers when the resolution changes
-   * @param[in] width network output width
-   * @param[in] height network output height
-   * @param[in] out_width published depth image width
-   * @param[in] out_height published depth image height
-   */
-  void initPostprocessBuffers(int width, int height, int out_width, int out_height);
-
-  /**
-   * @brief Build point cloud from depth image using camera intrinsics
-   * @param[in] camera_info camera calibration parameters
-   * @param[in] downsample_factor only publish every Nth point
-   * @param[in] rgb_image optional RGB image for colorizing point cloud
-   */
-  void buildPointCloud(
-    const sensor_msgs::msg::CameraInfo & camera_info, int downsample_factor,
-    const cv::Mat & rgb_image);
-public:
   void setSkyThreshold(float threshold) { sky_threshold_ = threshold; }
+  void setSkyDepthCap(float cap) { sky_depth_cap_ = cap; }
 
   std::unique_ptr<tensorrt_common::TrtCommon> trt_common_;
 
   // Input/output buffers
   CudaUniquePtr<float[]> input_d_;
+  size_t input_elem_num_{};
 
   // Output buffer for predicted depth
   CudaUniquePtr<float[]> depth_d_;
@@ -152,9 +133,6 @@ public:
   // Output buffer for predicted sky
   CudaUniquePtr<float[]> sky_d_;
   size_t sky_elem_num_{};
-  std::vector<CudaUniquePtr<float[]>> extra_output_buffers_;
-  cv::Mat model_depth_;
-  cv::Mat sky_mask_;
 
   StreamUniquePtr stream_{makeCudaStream()};
 
@@ -177,6 +155,12 @@ public:
   int post_out_width_{0};
   int post_out_height_{0};
 
+  // point cloud buffers, allocated for the current output size
+  CudaUniquePtr<uint8_t[]> color_model_d_;
+  CudaUniquePtr<uint8_t[]> point_cloud_d_;
+  CudaUniquePtrHost<uint8_t[]> point_cloud_h_;
+  size_t point_capacity_bytes_{0};
+
   int src_width_;
   int src_height_;
   int input_width_ = 504;
@@ -187,8 +171,69 @@ public:
   double scale_x_{1.0};
   double scale_y_{1.0};
   float sky_threshold_{0.3f};
-  const float sky_depth_cap_{200.0f};
+  float sky_depth_cap_{200.0f};
+  bool colorize_point_cloud_{false};
   sensor_msgs::msg::PointCloud2 point_cloud_;
+
+private:
+  /**
+   * @brief Resolve the engine's IO tensors by name/mode once and pre-allocate
+   * all input/output buffers so inference does no per-frame bookkeeping.
+   */
+  void resolveTensors();
+
+  /**
+   * @brief Make sure the engine input shape reflects batch_size_ for engines
+   * with a dynamic batch dimension.
+   */
+  void maybeSetInputShape();
+
+  /**
+   * @brief run preprocess including resizing, NHWC2NCHW and toFloat on GPU
+   * @param[in] images batching images
+   */
+  void preprocess(const std::vector<cv::Mat> & images);
+
+  /**
+   * @brief perform TensorRT inference
+   */
+  bool infer();
+
+  /**
+   * @brief postprocess inference results to generate depth and point cloud
+   * @param[in] camera_info camera calibration for point cloud generation
+   * @param[in] downsample_factor downsampling factor for point cloud
+   */
+  void postprocess(const sensor_msgs::msg::CameraInfo & camera_info, int downsample_factor);
+
+  /**
+   * @brief (re)allocate the postprocessing buffers when the resolution changes
+   * @param[in] width network output width
+   * @param[in] height network output height
+   * @param[in] out_width published depth image width
+   * @param[in] out_height published depth image height
+   */
+  void initPostprocessBuffers(int width, int height, int out_width, int out_height);
+
+  /**
+   * @brief Generate the PointCloud2 message on the GPU from the scaled depth
+   * and sky mask, colouring it from the (already uploaded) source frame.
+   * @param[in] camera_info camera calibration parameters
+   * @param[in] downsample_factor only publish every Nth point
+   */
+  void buildPointCloud(
+    const sensor_msgs::msg::CameraInfo & camera_info, int downsample_factor);
+
+  // Resolved tensor names and indices (set once in resolveTensors)
+  std::string input_tensor_name_;
+  std::string depth_tensor_name_;
+  std::string sky_tensor_name_;
+  int input_index_{-1};
+  int depth_index_{-1};
+  int sky_index_{-1};
+  std::vector<std::pair<std::string, void *>> bound_tensor_addresses_;
+  std::vector<CudaUniquePtr<float[]>> extra_output_buffers_;
+  std::vector<std::string> extra_tensor_names_;
 };
 
 }  // namespace depth_anything_v3

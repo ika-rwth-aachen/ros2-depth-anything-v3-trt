@@ -106,12 +106,15 @@ DepthAnythingV3Node::DepthAnythingV3Node(const rclcpp::NodeOptions & node_option
   
   RCLCPP_INFO(get_logger(), "Using ApproximateTime synchronizer with queue size 10");
 
-  // Debug callbacks to check if individual topics are arriving. The image one
-  // registers on sub_image_; a second subscription would decode every frame again.
-  sub_image_.registerCallback(std::bind(&DepthAnythingV3Node::onImageDebug, this, _1));
-  debug_camera_info_sub_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
-    resolved_camera_info_topic, rclcpp::SensorDataQoS(),
-    std::bind(&DepthAnythingV3Node::onCameraInfoDebug, this, std::placeholders::_1));
+  // Debug subscriptions/statistics only when explicitly enabled. One level of
+  // subscribers decodes every frame, so keeping them out of the default path
+  // avoids unnecessary work and log noise.
+  if (node_param_.enable_debug) {
+    sub_image_.registerCallback(std::bind(&DepthAnythingV3Node::onImageDebug, this, _1));
+    debug_camera_info_sub_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
+      resolved_camera_info_topic, rclcpp::SensorDataQoS(),
+      std::bind(&DepthAnythingV3Node::onCameraInfoDebug, this, std::placeholders::_1));
+  }
 
   // Publishers
   pub_depth_image_ = create_publisher<sensor_msgs::msg::Image>("~/output/depth_image", 1);
@@ -150,9 +153,9 @@ DepthAnythingV3Node::DepthAnythingV3Node(const rclcpp::NodeOptions & node_option
   tensorrt_common::BuildConfig build_config(calibType, dla, first, last, prof, clip);
 
   int batch = 1;
-  tensorrt_common::BatchConfig batch_config{1, batch / 2, batch};
+  tensorrt_common::BatchConfig batch_config{1, batch, batch};
 
-  bool use_gpu_preprocess = false;
+  bool use_gpu_preprocess = true;
   std::string calibration_images = "calibration_images.txt";
   const size_t workspace_size = (1 << 30);
 
@@ -160,6 +163,7 @@ DepthAnythingV3Node::DepthAnythingV3Node(const rclcpp::NodeOptions & node_option
     node_param_.onnx_path, node_param_.precision, build_config, use_gpu_preprocess,
     calibration_images, batch_config, workspace_size);
   tensorrt_depth_anything_->setSkyThreshold(static_cast<float>(node_param_.sky_threshold));
+  tensorrt_depth_anything_->setSkyDepthCap(static_cast<float>(node_param_.sky_depth_cap));
     
   RCLCPP_INFO(get_logger(), "Finished initializing Depth Anything V3 TensorRT model");
 }
@@ -175,16 +179,6 @@ void DepthAnythingV3Node::onImageCameraInfo(
   } catch (cv_bridge::Exception & e) {
     RCLCPP_ERROR(this->get_logger(), "cv_bridge exception: %s", e.what());
     return;
-  }
-  
-  const auto width = in_image_ptr->image.cols;
-  const auto height = in_image_ptr->image.rows;
-
-  if (!is_initialized_) {
-    RCLCPP_INFO(get_logger(), "Initializing TensorRT preprocessing buffer for %dx%d images", width, height);
-    tensorrt_depth_anything_->initPreprocessBuffer(width, height);
-    is_initialized_ = true;
-    RCLCPP_INFO(get_logger(), "TensorRT preprocessing buffer initialized");
   }
 
   std::vector<cv::Mat> input_images;
@@ -233,15 +227,14 @@ void DepthAnythingV3Node::onImageCameraInfo(
     cv::Mat depth_vis_8u;
     cv::applyColorMap(depth_norm, depth_vis_8u, getColorMapType(node_param_.debug_colormap));
     
-    // Add FPS text overlay using rolling average
-    static std::vector<double> inference_times;
-    inference_times.push_back(inference_time_sec);
-    if (inference_times.size() > 20) {
-      inference_times.erase(inference_times.begin());
+    // Add FPS text overlay using rolling average (per-node, not static)
+    inference_times_.push_back(inference_time_sec);
+    if (inference_times_.size() > 20) {
+      inference_times_.pop_front();
     }
 
     const double mean_inference_time = std::accumulate(
-      inference_times.begin(), inference_times.end(), 0.0) / inference_times.size();
+      inference_times_.begin(), inference_times_.end(), 0.0) / inference_times_.size();
     const int fps = static_cast<int>(1.0 / mean_inference_time);
     
     // Extract just the filename from the ONNX path
@@ -279,12 +272,21 @@ rcl_interfaces::msg::SetParametersResult DepthAnythingV3Node::onSetParam(
   const std::vector<rclcpp::Parameter> & params)
 {
   rcl_interfaces::msg::SetParametersResult result;
+
+  // Model / engine selection is fixed at construction time. Accepting a change
+  // here would silently have no effect, so reject it explicitly.
+  for (const auto & param : params) {
+    if (param.get_name() == "onnx_path" || param.get_name() == "precision") {
+      result.successful = false;
+      result.reason = param.get_name() + " cannot be changed at runtime (restart required)";
+      return result;
+    }
+  }
+
   try {
     auto & p = node_param_;
     
     // Update all parameters uniformly
-    update_param(params, "onnx_path", p.onnx_path);
-    update_param(params, "precision", p.precision);
     update_param(params, "enable_debug", p.enable_debug);
     update_param(params, "debug_colormap", p.debug_colormap);
     update_param(params, "debug_filepath", p.debug_filepath);
@@ -299,6 +301,7 @@ rcl_interfaces::msg::SetParametersResult DepthAnythingV3Node::onSetParam(
     // Apply runtime-configurable model parameters
     if (tensorrt_depth_anything_) {
       tensorrt_depth_anything_->setSkyThreshold(static_cast<float>(p.sky_threshold));
+      tensorrt_depth_anything_->setSkyDepthCap(static_cast<float>(p.sky_depth_cap));
     }
   } catch (const rclcpp::exceptions::InvalidParameterTypeException & e) {
     result.successful = false;

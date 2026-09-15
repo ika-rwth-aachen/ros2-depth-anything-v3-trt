@@ -77,6 +77,51 @@ __global__ void resizeCubicNormalizeNCHW(
     dst[c * plane_size + i] = (value * (1.0f / 255.0f) - c_mean[c]) * c_inv_std[c];
   }
 }
+
+// Bilinear BGR8 resize feeding the point cloud colouring. Cheap (no
+// normalisation), so it can run every frame on the uploaded source frame.
+__global__ void resizeBgrBilinear(
+  const uchar3 * __restrict__ src, int src_width, int src_height,
+  uchar3 * __restrict__ dst, int dst_width, int dst_height)
+{
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= dst_width || y >= dst_height) return;
+
+  const float fx = (x + 0.5f) * src_width / dst_width - 0.5f;
+  const float fy = (y + 0.5f) * src_height / dst_height - 0.5f;
+  const int ix = __float2int_rd(fx);
+  const int iy = __float2int_rd(fy);
+  const float tx = fx - ix;
+  const float ty = fy - iy;
+
+  const int x0 = min(max(ix, 0), src_width - 1);
+  const int x1 = min(max(ix + 1, 0), src_width - 1);
+  const int y0 = min(max(iy, 0), src_height - 1);
+  const int y1 = min(max(iy + 1, 0), src_height - 1);
+
+  const uchar3 p00 = src[y0 * src_width + x0];
+  const uchar3 p10 = src[y0 * src_width + x1];
+  const uchar3 p01 = src[y1 * src_width + x0];
+  const uchar3 p11 = src[y1 * src_width + x1];
+
+  float acc[3];
+  for (int c = 0; c < 3; ++c) {
+    const float v0 = (&p00.x)[c];
+    const float v1 = (&p10.x)[c];
+    const float v2 = (&p01.x)[c];
+    const float v3 = (&p11.x)[c];
+    const float top = v0 + tx * (v1 - v0);
+    const float bottom = v2 + tx * (v3 - v2);
+    acc[c] = fminf(fmaxf(rintf(top + ty * (bottom - top)), 0.0f), 255.0f);
+  }
+
+  uchar3 out;
+  out.x = static_cast<unsigned char>(acc[0]);
+  out.y = static_cast<unsigned char>(acc[1]);
+  out.z = static_cast<unsigned char>(acc[2]);
+  dst[y * dst_width + x] = out;
+}
 }  // namespace
 
 void launchPreprocess(
@@ -88,6 +133,18 @@ void launchPreprocess(
   resizeCubicNormalizeNCHW<<<grid, block, 0, stream>>>(
     reinterpret_cast<const uchar3 *>(src_bgr), src_width, src_height,
     dst_nchw, dst_width, dst_height);
+  CHECK_CUDA_ERROR(cudaGetLastError());
+}
+
+void launchResizeColor(
+  const uint8_t * src_bgr, int src_width, int src_height,
+  uint8_t * dst_bgr, int dst_width, int dst_height, cudaStream_t stream)
+{
+  const dim3 block(16, 16);
+  const dim3 grid((dst_width + block.x - 1) / block.x, (dst_height + block.y - 1) / block.y);
+  resizeBgrBilinear<<<grid, block, 0, stream>>>(
+    reinterpret_cast<const uchar3 *>(src_bgr), src_width, src_height,
+    reinterpret_cast<uchar3 *>(dst_bgr), dst_width, dst_height);
   CHECK_CUDA_ERROR(cudaGetLastError());
 }
 

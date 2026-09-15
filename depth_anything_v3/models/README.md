@@ -10,11 +10,11 @@ Place your Depth Anything V3 ONNX or engine file here (update the config path ac
 
 ## Model Format
 
-Expected model specifications:
-- **Input**: RGB image, shape [1, 3, 388, 504], type float32, range [0, 1]
+Expected model specifications (matches the export script in `onnx/export.py`):
+- **Input**: RGB image, shape `[1, 3, 280, 504]` (batch, channels, height, width), type float32, range [0, 1]
 - **Outputs**:
-  - `depth`: metric depth map [1, 1, 388, 504]
-  - `confidence` (optional): per-pixel confidence map used for filtering noisy points
+  - `depth`: metric depth map `[1, 1, 280, 504]`
+  - `sky`: sky classification logits `[1, 1, 280, 504]` (lower values = sky)
 
 ## Installation
 
