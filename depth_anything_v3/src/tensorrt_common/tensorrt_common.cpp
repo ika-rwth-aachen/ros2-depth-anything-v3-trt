@@ -17,6 +17,7 @@
 #include <NvInferPlugin.h>
 #include <dlfcn.h>
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -178,13 +179,13 @@ void TrtCommon::setup()
     cache_engine_path = model_file_path_;
     cache_engine_path.replace_extension(ext);
 
-    // Output Network Information
-    printNetworkInfo(model_file_path_);
-
     if (fs::exists(cache_engine_path)) {
       std::cout << "Loading... " << cache_engine_path << std::endl;
       loadEngine(cache_engine_path);
     } else {
+      // Network info is only useful while building; skip it on the cached path
+      // so pure startup stays fast.
+      printNetworkInfo(model_file_path_);
       std::cout << "Building... " << cache_engine_path << std::endl;
       logger_.log(nvinfer1::ILogger::Severity::kINFO, "Start build engine");
       buildEngineFromOnnx(model_file_path_, cache_engine_path);

@@ -36,8 +36,8 @@ find_package(image_transport REQUIRED)
 find_package(OpenCV 4 REQUIRED)
 
 # Find CUDA
-find_package(CUDA REQUIRED)
 enable_language(CUDA)
+find_package(CUDA REQUIRED)
 
 # Find TensorRT
 find_path(TENSORRT_INCLUDE_DIR NvInfer.h

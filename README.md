@@ -192,14 +192,16 @@ Performance on Quadro RTX 6000:
 ```
 Input Image + Camera Info
          ↓
-    Preprocessing (CPU/GPU)
+    Preprocessing (GPU, async pinned upload)
          ↓  
     TensorRT Inference (GPU)
          ↓
-    Postprocessing (CPU)
+    Postprocessing (GPU: scaling, sky fill, upscale, point cloud)
          ↓
    Depth Image + Point Cloud
 ```
+
+All image processing — normalization, depth scaling, sky handling, upscaling and point cloud generation — runs on the GPU inside a single CUDA stream. The host only copies the published results back (full-resolution depth image and packed point cloud) and performs one stream synchronization per frame.
 
 ## Depth Postprocessing Pipeline
 

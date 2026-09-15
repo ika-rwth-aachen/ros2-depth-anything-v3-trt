@@ -228,6 +228,50 @@ __global__ void upscaleCubic(
   }
   dst[y * dst_width + x] = acc;
 }
+
+// One thread per output point. Invalid (sky or non-finite) pixels become a NaN
+// point, mirroring the previous CPU implementation. The payload stride is 12
+// (xyz) or 15 (xyz + r,g,b) bytes, matching sensor_msgs::PointCloud2 fields.
+__global__ void buildPointCloudKernel(
+  const float * __restrict__ depth, const uint8_t * __restrict__ mask,
+  const uint8_t * __restrict__ color, int width, int height,
+  float fx, float fy, float cx, float cy, int downsample, int with_color,
+  uint8_t * __restrict__ out, int out_width, int out_height)
+{
+  const int ox = blockIdx.x * blockDim.x + threadIdx.x;
+  const int oy = blockIdx.y * blockDim.y + threadIdx.y;
+  if (ox >= out_width || oy >= out_height) return;
+
+  const int u = min(ox * downsample, width - 1);
+  const int v = min(oy * downsample, height - 1);
+  const int idx = v * width + u;
+
+  uint8_t * out_pt = out + static_cast<size_t>(oy * out_width + ox) * (with_color ? 15u : 12u);
+
+  const float bad = __uint_as_float(0x7FC00000u);  // quiet NaN
+  float x = bad;
+  float y = bad;
+  float z = bad;
+
+  const float d = depth[idx];
+  if (mask[idx] != 0u && d > 0.0f && isfinite(d)) {
+    x = static_cast<float>((u - cx) * d / fx);
+    y = static_cast<float>((v - cy) * d / fy);
+    z = d;
+  }
+
+  auto * fp = reinterpret_cast<float *>(out_pt);
+  fp[0] = x;
+  fp[1] = y;
+  fp[2] = z;
+
+  if (with_color) {
+    const uint8_t * src_col = color + static_cast<size_t>(idx) * 3u;  // BGR
+    out_pt[12] = src_col[2];
+    out_pt[13] = src_col[1];
+    out_pt[14] = src_col[0];
+  }
+}
 }  // namespace
 
 size_t postprocessScratchBytes(int num_pixels)
@@ -282,6 +326,20 @@ void launchPostprocess(
   upscaleCubic<<<grid, block, 0, stream>>>(
     depth_out, width, height, depth_full_out, out_width, out_height);
 
+  CHECK_CUDA_ERROR(cudaGetLastError());
+}
+
+void launchBuildPointCloud(
+  const float * depth, const uint8_t * mask, const uint8_t * color_bgr,
+  int width, int height, float fx, float fy, float cx, float cy,
+  int downsample, bool with_color, uint8_t * out_packed,
+  int out_width, int out_height, cudaStream_t stream)
+{
+  const dim3 block(16, 16);
+  const dim3 grid((out_width + block.x - 1) / block.x, (out_height + block.y - 1) / block.y);
+  buildPointCloudKernel<<<grid, block, 0, stream>>>(
+    depth, mask, color_bgr, width, height, fx, fy, cx, cy, downsample, with_color ? 1 : 0,
+    out_packed, out_width, out_height);
   CHECK_CUDA_ERROR(cudaGetLastError());
 }
 

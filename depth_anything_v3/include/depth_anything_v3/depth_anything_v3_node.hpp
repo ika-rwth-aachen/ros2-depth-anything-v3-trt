@@ -20,6 +20,7 @@
 #else
 #include <cv_bridge/cv_bridge.h>
 #endif
+#include <deque>
 #include <memory>
 #include <opencv2/opencv.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -95,9 +96,11 @@ private:
   // Parameter
   NodeParam node_param_{};
 
+  // Rolling window of recent per-frame inference times for the FPS overlay.
+  std::deque<double> inference_times_;
+
   // Core
   std::shared_ptr<TensorRTDepthAnything> tensorrt_depth_anything_;
-  bool is_initialized_ = false;
 };
 
 } // namespace depth_anything_v3

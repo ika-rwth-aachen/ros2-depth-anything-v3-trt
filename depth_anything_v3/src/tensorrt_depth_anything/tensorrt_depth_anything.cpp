@@ -15,15 +15,15 @@
 #include <algorithm>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 #include <cmath>
-#include <limits>
 #include <cstring>
-#include <iostream>
 
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
@@ -44,87 +44,7 @@ static size_t volumeFromDims(const nvinfer1::Dims & dims, int batch_size)
       return acc * (dim == -1 ? static_cast<size_t>(batch_size) : static_cast<size_t>(dim));
     });
 }
-
-// Simple depth to point cloud conversion using camera intrinsics
-static void depthImageToPointCloud(
-  const cv::Mat & depth_image,
-  const sensor_msgs::msg::CameraInfo & camera_info,
-  sensor_msgs::msg::PointCloud2 & cloud_msg,
-  const std::string & frame_id,
-  int downsample_factor = 1,
-  const cv::Mat & rgb_image = cv::Mat(),
-  const cv::Mat & non_sky_mask = cv::Mat())
-{
-  cloud_msg.header.frame_id = frame_id;
-  
-  const int downsampled_height = (depth_image.rows + downsample_factor - 1) / downsample_factor;
-  const int downsampled_width = (depth_image.cols + downsample_factor - 1) / downsample_factor;
-  
-  cloud_msg.height = downsampled_height;
-  cloud_msg.width = downsampled_width;
-  cloud_msg.is_dense = false;
-  cloud_msg.is_bigendian = false;
-
-  sensor_msgs::PointCloud2Modifier pcd_modifier(cloud_msg);
-  const bool has_color = !rgb_image.empty();
-  if (has_color) {
-    pcd_modifier.setPointCloud2FieldsByString(2, "xyz", "rgb");
-  } else {
-    pcd_modifier.setPointCloud2FieldsByString(1, "xyz");
-  }
-
-  const double fx = camera_info.k[0];
-  const double fy = camera_info.k[4]; 
-  const double cx = camera_info.k[2];
-  const double cy = camera_info.k[5];
-
-  sensor_msgs::PointCloud2Iterator<float> iter_x(cloud_msg, "x");
-  sensor_msgs::PointCloud2Iterator<float> iter_y(cloud_msg, "y");
-  sensor_msgs::PointCloud2Iterator<float> iter_z(cloud_msg, "z");
-  std::unique_ptr<sensor_msgs::PointCloud2Iterator<uint8_t>> iter_r, iter_g, iter_b;
-  if (has_color) {
-    iter_r = std::make_unique<sensor_msgs::PointCloud2Iterator<uint8_t>>(cloud_msg, "r");
-    iter_g = std::make_unique<sensor_msgs::PointCloud2Iterator<uint8_t>>(cloud_msg, "g");
-    iter_b = std::make_unique<sensor_msgs::PointCloud2Iterator<uint8_t>>(cloud_msg, "b");
-  }
-
-  const float bad_point = std::numeric_limits<float>::quiet_NaN();
-
-  const bool use_mask = !non_sky_mask.empty();
-
-  for (int v = 0; v < depth_image.rows; v += downsample_factor) {
-    for (int u = 0; u < depth_image.cols; u += downsample_factor) {
-      if (use_mask && non_sky_mask.at<uint8_t>(v, u) == 0) {
-        *iter_x = *iter_y = *iter_z = bad_point;
-        if (has_color) { **iter_r = **iter_g = **iter_b = 0; }
-        ++iter_x; ++iter_y; ++iter_z;
-        if (has_color) { ++(*iter_r); ++(*iter_g); ++(*iter_b); }
-        continue;
-      }
-
-      const float depth = depth_image.at<float>(v, u);
-      
-      if (depth <= 0.0f || !std::isfinite(depth)) {
-        *iter_x = *iter_y = *iter_z = bad_point;
-        if (has_color) { **iter_r = **iter_g = **iter_b = 0; }
-      } else {
-        *iter_x = static_cast<float>((u - cx) * depth / fx);
-        *iter_y = static_cast<float>((v - cy) * depth / fy);
-        *iter_z = depth;
-        if (has_color) {
-          const cv::Vec3b rgb = rgb_image.at<cv::Vec3b>(v, u);
-          **iter_r = rgb[2];
-          **iter_g = rgb[1];
-          **iter_b = rgb[0];
-        }
-      }
-      ++iter_x; ++iter_y; ++iter_z;
-      if (has_color) { ++(*iter_r); ++(*iter_g); ++(*iter_b); }
-    }
-  }
-}
-
-} // anonymous namespace
+}  // anonymous namespace
 
 namespace depth_anything_v3
 {
@@ -147,57 +67,134 @@ TensorRTDepthAnything::TensorRTDepthAnything(
   trt_common_ = std::make_unique<tensorrt_common::TrtCommon>(
     model_path, precision, nullptr, batch_config, max_workspace_size, build_config);
   trt_common_->setup();
+  if (!trt_common_->isInitialized()) {
+    throw std::runtime_error("Failed to initialize TensorRT engine from: " + model_path);
+  }
 
+  // Resolve the IO tensor list and pre-allocate every input/output buffer once.
+  resolveTensors();
+}
+
+void TensorRTDepthAnything::resolveTensors()
+{
   auto * engine = trt_common_->getEngine();
-  depth_elem_num_ = 0;
-  sky_elem_num_ = 0;
-  for (int i = 0; i < trt_common_->getNbIOTensors(); ++i) {
-    const char * name = engine->getIOTensorName(i);
-    const auto dims = trt_common_->getBindingDimensions(i);
-    if (name && std::string(name) == "depth") {
-      depth_elem_num_ = volumeFromDims(dims, batch_size_);
-    } else if (name && std::string(name) == "sky") {
-      sky_elem_num_ = volumeFromDims(dims, batch_size_);
+  const int32_t nb = trt_common_->getNbIOTensors();
+
+  input_index_ = -1;
+  depth_index_ = -1;
+  sky_index_ = -1;
+
+  for (int32_t i = 0; i < nb; ++i) {
+    const char * raw_name = engine->getIOTensorName(i);
+    if (raw_name == nullptr) {
+      continue;
+    }
+    const std::string name(raw_name);
+    if (engine->getTensorIOMode(raw_name) == nvinfer1::TensorIOMode::kINPUT) {
+      input_index_ = i;
+      input_tensor_name_ = name;
+    } else if (name == "depth") {
+      depth_index_ = i;
+      depth_tensor_name_ = name;
+    } else if (name == "sky") {
+      sky_index_ = i;
+      sky_tensor_name_ = name;
     }
   }
-  if (depth_elem_num_ == 0) {
-    // Fallback to the first output binding if names are unavailable
-    const auto dims = trt_common_->getBindingDimensions(1);
-    depth_elem_num_ = volumeFromDims(dims, batch_size_);
+
+  // Fallbacks for engines whose output tensors are not named "depth"/"sky".
+  if (input_index_ < 0) {
+    input_index_ = 0;
+    input_tensor_name_ = engine->getIOTensorName(input_index_);
   }
-  if (sky_elem_num_ == 0) {
-    throw std::runtime_error("Expected TensorRT engine to expose 'sky' output tensor, but none was found");
+  if (depth_index_ < 0) {
+    for (int32_t i = 0; i < nb; ++i) {
+      if (i != input_index_) {
+        depth_index_ = i;
+        depth_tensor_name_ = engine->getIOTensorName(i);
+        break;
+      }
+    }
+  }
+  if (sky_index_ < 0) {
+    throw std::runtime_error(
+      "Expected TensorRT engine to expose 'sky' output tensor, but none was found");
+  }
+  if (depth_index_ < 0 || input_index_ < 0) {
+    throw std::runtime_error("Failed to resolve TensorRT engine input/output tensors");
   }
 
-  // Allocate GPU memory for outputs
+  const auto input_dims = trt_common_->getBindingDimensions(input_index_);
+  input_height_ = input_dims.nbDims > 2 ? input_dims.d[2] : 0;
+  input_width_ = input_dims.nbDims > 3 ? input_dims.d[3] : 0;
+
+  input_elem_num_ = volumeFromDims(input_dims, batch_size_);
+  depth_elem_num_ = volumeFromDims(trt_common_->getBindingDimensions(depth_index_), batch_size_);
+  sky_elem_num_ = volumeFromDims(trt_common_->getBindingDimensions(sky_index_), batch_size_);
+
+  input_d_ = cuda_utils::make_unique<float[]>(input_elem_num_);
   depth_d_ = cuda_utils::make_unique<float[]>(depth_elem_num_);
   sky_d_ = cuda_utils::make_unique<float[]>(sky_elem_num_);
 
-  // Get input dimensions
-  const auto input_dims = trt_common_->getBindingDimensions(0);
-  const int input_channels = input_dims.d[1];
-  input_height_ = input_dims.d[2]; 
-  input_width_ = input_dims.d[3];
-  
-  // Allocate input memory
-  const size_t input_elem_num = batch_size_ * input_channels * input_height_ * input_width_;
-  input_d_ = cuda_utils::make_unique<float[]>(input_elem_num);
+  extra_output_buffers_.clear();
+  extra_tensor_names_.clear();
+  for (int32_t i = 0; i < nb; ++i) {
+    if (i == input_index_ || i == depth_index_ || i == sky_index_) {
+      continue;
+    }
+    const char * raw_name = engine->getIOTensorName(i);
+    extra_tensor_names_.emplace_back(raw_name != nullptr ? raw_name : std::string());
+    const size_t elem_count =
+      volumeFromDims(trt_common_->getBindingDimensions(i), batch_size_);
+    extra_output_buffers_.push_back(cuda_utils::make_unique<float[]>(elem_count));
+  }
 
+  bound_tensor_addresses_.clear();
+  bound_tensor_addresses_.emplace_back(input_tensor_name_, static_cast<void *>(input_d_.get()));
+  bound_tensor_addresses_.emplace_back(depth_tensor_name_, static_cast<void *>(depth_d_.get()));
+  bound_tensor_addresses_.emplace_back(sky_tensor_name_, static_cast<void *>(sky_d_.get()));
+  for (size_t j = 0; j < extra_tensor_names_.size(); ++j) {
+    bound_tensor_addresses_.emplace_back(
+      extra_tensor_names_[j], static_cast<void *>(extra_output_buffers_[j].get()));
+  }
+
+  // Addresses are stable for the lifetime of the engine (fixed shapes), so bind
+  // them once instead of re-evaluating the tensor list on every frame.
+  auto * context = trt_common_->getContext();
+  for (const auto & [name, ptr] : bound_tensor_addresses_) {
+    if (!name.empty()) {
+      context->setTensorAddress(name.c_str(), ptr);
+    }
+  }
+}
+
+void TensorRTDepthAnything::maybeSetInputShape()
+{
+  if (input_index_ < 0) {
+    return;
+  }
+  const auto current = trt_common_->getBindingDimensions(input_index_);
+  if (current.nbDims > 0 && current.d[0] == -1) {
+    auto dims = current;
+    dims.d[0] = batch_size_;
+    trt_common_->setBindingDimensions(input_index_, dims);
+  }
 }
 
 void TensorRTDepthAnything::initPreprocessBuffer(int width, int height)
 {
+  if (width <= 0 || height <= 0) {
+    return;
+  }
   src_width_ = width;
   src_height_ = height;
   scale_x_ = static_cast<double>(input_width_) / static_cast<double>(src_width_);
   scale_y_ = static_cast<double>(input_height_) / static_cast<double>(src_height_);
-  
-  if (use_gpu_preprocess_) {
-    const size_t image_size = src_width_ * src_height_ * 3; // RGB
-    image_buf_h_ = cuda_utils::make_unique_host<unsigned char[]>(
-      image_size * batch_size_, cudaHostAllocDefault);
-    image_buf_d_ = cuda_utils::make_unique<unsigned char[]>(image_size * batch_size_);
-  }
+
+  const size_t image_size = static_cast<size_t>(src_width_) * src_height_ * 3;  // RGB
+  image_buf_h_ = cuda_utils::make_unique_host<unsigned char[]>(image_size, cudaHostAllocDefault);
+  image_buf_d_ = cuda_utils::make_unique<unsigned char[]>(image_size);
+  image_buf_bytes_ = image_size;
 }
 
 void TensorRTDepthAnything::initPostprocessBuffers(
@@ -223,7 +220,7 @@ void TensorRTDepthAnything::initPostprocessBuffers(
 }
 
 bool TensorRTDepthAnything::doInference(
-  const std::vector<cv::Mat> & images, 
+  const std::vector<cv::Mat> & images,
   const sensor_msgs::msg::CameraInfo & camera_info,
   int downsample_factor,
   bool colorize_pointcloud)
@@ -240,6 +237,8 @@ bool TensorRTDepthAnything::doInference(
     return false;
   }
 
+  colorize_point_cloud_ = colorize_pointcloud;
+
   // Preprocess
   preprocess(images);
 
@@ -248,92 +247,74 @@ bool TensorRTDepthAnything::doInference(
     return false;
   }
 
-  // Postprocess with downsampling
-  cv::Mat rgb_for_pointcloud = colorize_pointcloud ? images[0] : cv::Mat();
-  postprocess(camera_info, downsample_factor, rgb_for_pointcloud);
-  
+  // Postprocess (depth image + point cloud)
+  postprocess(camera_info, std::max(1, downsample_factor));
+
   return true;
 }
 
 void TensorRTDepthAnything::preprocess(const std::vector<cv::Mat> & images)
 {
-  auto input_dims = trt_common_->getBindingDimensions(0);
-  if (input_dims.d[0] == -1) {
-    input_dims.d[0] = batch_size_;
-  }
-  trt_common_->setBindingDimensions(0, input_dims);
-
-  input_height_ = input_dims.d[2];
-  input_width_ = input_dims.d[3];
-  scale_x_ = static_cast<double>(input_width_) / static_cast<double>(src_width_);
-  scale_y_ = static_cast<double>(input_height_) / static_cast<double>(src_height_);
-
-  // Upload the frame and let one kernel write the normalised NCHW tensor
-  // straight into the engine's input buffer.
   const cv::Mat & src_image = images[0];
-  const size_t row_bytes = static_cast<size_t>(src_image.cols) * 3;
-  const size_t src_bytes = row_bytes * src_image.rows;
-  if (!image_buf_d_ || src_bytes != image_buf_bytes_) {
+  const int width = src_image.cols;
+  const int height = src_image.rows;
+  if (width <= 0 || height <= 0 || src_image.data == nullptr) {
+    RCLCPP_ERROR(
+      rclcpp::get_logger("TensorRTDepthAnything"), "Invalid source image dimensions.");
+    return;
+  }
+
+  // Re-initialise buffers when the camera resolution changes (exposure changes,
+  // camera reboot, ...). Previously this only ever happened on the first frame.
+  if (src_width_ != width || src_height_ != height) {
+    src_width_ = width;
+    src_height_ = height;
+    scale_x_ = static_cast<double>(input_width_) / static_cast<double>(src_width_);
+    scale_y_ = static_cast<double>(input_height_) / static_cast<double>(src_height_);
+  }
+
+  const size_t row_bytes = static_cast<size_t>(width) * 3;
+  const size_t src_bytes = row_bytes * static_cast<size_t>(height);
+
+  // Stage the frame in a pinned buffer once and do a single fast asynchronous
+  // upload. cuMemcpy2DAsync from unpinned cv::Mat memory would block on the
+  // host-sized copy; pinning lets the copy overlap with GPU work.
+  if (!image_buf_h_ || src_bytes != image_buf_bytes_) {
+    image_buf_h_ = cuda_utils::make_unique_host<unsigned char[]>(src_bytes, cudaHostAllocDefault);
     image_buf_d_ = cuda_utils::make_unique<unsigned char[]>(src_bytes);
     image_buf_bytes_ = src_bytes;
   }
-  CHECK_CUDA_ERROR(cudaMemcpy2DAsync(
-    image_buf_d_.get(), row_bytes, src_image.data, src_image.step,
-    row_bytes, src_image.rows, cudaMemcpyHostToDevice, *stream_));
-  launchPreprocess(
-    image_buf_d_.get(), src_image.cols, src_image.rows,
-    input_d_.get(), input_width_, input_height_, *stream_);
 
-  auto * engine = trt_common_->getEngine();
-  for (int i = 0; i < trt_common_->getNbIOTensors(); ++i) {
-    const char * name = engine->getIOTensorName(i);
-    const auto dims = trt_common_->getBindingDimensions(i);
-    const size_t required_output_elems = volumeFromDims(dims, batch_size_);
-    if (name && std::string(name) == "depth") {
-      if (required_output_elems != depth_elem_num_) {
-        depth_elem_num_ = required_output_elems;
-        depth_d_ = cuda_utils::make_unique<float[]>(depth_elem_num_);
-      }
-    } else if (name && std::string(name) == "sky") {
-      if (required_output_elems != sky_elem_num_) {
-        sky_elem_num_ = required_output_elems;
-        sky_d_ = cuda_utils::make_unique<float[]>(sky_elem_num_);
-      }
+  const unsigned char * src_data = src_image.data;
+  const size_t src_step = src_image.step;
+  unsigned char * pinned = image_buf_h_.get();
+  if (src_step == row_bytes) {
+    std::memcpy(pinned, src_data, src_bytes);
+  } else {
+    // A ROS image may declare a step larger than width * channels. The GPU
+    // kernels expect packed rows, so drop the padding here.
+    for (int r = 0; r < height; ++r) {
+      std::memcpy(pinned + r * row_bytes, src_data + r * src_step, row_bytes);
     }
   }
+
+  CHECK_CUDA_ERROR(cudaMemcpyAsync(
+    image_buf_d_.get(), pinned, src_bytes, cudaMemcpyHostToDevice, *stream_));
+
+  maybeSetInputShape();
+  launchPreprocess(
+    image_buf_d_.get(), width, height,
+    input_d_.get(), input_width_, input_height_, *stream_);
 }
 
 bool TensorRTDepthAnything::infer()
 {
+  maybeSetInputShape();
   auto * context = trt_common_->getContext();
-  auto * engine = trt_common_->getEngine();
-
-  extra_output_buffers_.clear();
-
-  for (int i = 0; i < trt_common_->getNbIOTensors(); ++i) {
-    const char * name = engine->getIOTensorName(i);
-    const std::string tensor_name = name ? std::string(name) : std::string();
-    const bool is_input = engine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT;
-
-    void * buffer_ptr = nullptr;
-    if (is_input || tensor_name.find("input") != std::string::npos ||
-        tensor_name.find("image") != std::string::npos) {
-      buffer_ptr = input_d_.get();
-    } else if (tensor_name == "depth" || tensor_name.find("depth") != std::string::npos) {
-      buffer_ptr = depth_d_.get();
-    } else if (tensor_name == "sky" || tensor_name.find("sky") != std::string::npos) {
-      if (!sky_d_ && sky_elem_num_ > 0) {
-        sky_d_ = cuda_utils::make_unique<float[]>(sky_elem_num_);
-      }
-      buffer_ptr = sky_d_ ? static_cast<void *>(sky_d_.get()) : static_cast<void *>(depth_d_.get());
-    } else {
-      const auto dims = trt_common_->getBindingDimensions(i);
-      const size_t elem_count = volumeFromDims(dims, batch_size_);
-      extra_output_buffers_.push_back(cuda_utils::make_unique<float[]>(elem_count));
-      buffer_ptr = extra_output_buffers_.back().get();
+  for (const auto & [name, ptr] : bound_tensor_addresses_) {
+    if (!name.empty()) {
+      context->setTensorAddress(name.c_str(), ptr);
     }
-
-    context->setTensorAddress(name, buffer_ptr);
   }
 
   if (!trt_common_->enqueueV3(*stream_)) {
@@ -344,9 +325,13 @@ bool TensorRTDepthAnything::infer()
 }
 
 void TensorRTDepthAnything::postprocess(
-  const sensor_msgs::msg::CameraInfo & camera_info, int downsample_factor, const cv::Mat & rgb_image)
+  const sensor_msgs::msg::CameraInfo & camera_info, int downsample_factor)
 {
-  const auto output_dims = trt_common_->getBindingDimensions(1);
+  if (depth_index_ < 0 || src_width_ <= 0 || src_height_ <= 0) {
+    return;
+  }
+
+  const auto output_dims = trt_common_->getBindingDimensions(depth_index_);
   const int height = output_dims.nbDims > 2 ? output_dims.d[2] : input_height_;
   const int width = output_dims.nbDims > 3 ? output_dims.d[3] : input_width_;
 
@@ -370,71 +355,96 @@ void TensorRTDepthAnything::postprocess(
     depth_scaled_d_.get(), sky_mask_d_.get(), depth_full_d_.get(),
     post_scratch_d_.get(), post_scratch_bytes_, *stream_);
 
-  model_depth_.create(height, width, CV_32FC1);
-  sky_mask_.create(height, width, CV_8UC1);
+  // Copy the full-resolution depth image (published) back to the host.
   depth_image_.create(src_height_, src_width_, CV_32FC1);
-  CHECK_CUDA_ERROR(cudaMemcpyAsync(
-    model_depth_.data, depth_scaled_d_.get(), plane_size * sizeof(float),
-    cudaMemcpyDeviceToHost, *stream_));
-  CHECK_CUDA_ERROR(cudaMemcpyAsync(
-    sky_mask_.data, sky_mask_d_.get(), plane_size, cudaMemcpyDeviceToHost, *stream_));
   CHECK_CUDA_ERROR(cudaMemcpyAsync(
     depth_image_.data, depth_full_d_.get(), full_size * sizeof(float),
     cudaMemcpyDeviceToHost, *stream_));
+
+  // The point cloud is generated entirely on the device from the model-size
+  // depth and sky mask; no model-size host copies are needed.
+  buildPointCloud(camera_info, downsample_factor);
+
   CHECK_CUDA_ERROR(cudaStreamSynchronize(*stream_));
 
-  cv::Mat colorized = rgb_image;
-  if (!colorized.empty() &&
-      (colorized.rows != depth_image_.rows || colorized.cols != depth_image_.cols)) {
-    cv::resize(colorized, colorized, depth_image_.size(), 0, 0, cv::INTER_LINEAR);
+  // Hand the packed points over to the ROS message.
+  if (point_cloud_h_ && !point_cloud_.data.empty()) {
+    std::memcpy(point_cloud_.data.data(), point_cloud_h_.get(), point_cloud_.data.size());
   }
-
-  buildPointCloud(camera_info, downsample_factor, colorized);
 }
-
 
 void TensorRTDepthAnything::buildPointCloud(
-  const sensor_msgs::msg::CameraInfo & camera_info, int downsample_factor,
-  const cv::Mat & rgb_image)
+  const sensor_msgs::msg::CameraInfo & camera_info, int downsample_factor)
 {
-
-  // Resize color to match model output if provided.
-  cv::Mat color;
-  if (!rgb_image.empty()) {
-    if (rgb_image.type() == CV_8UC3) {
-      color = rgb_image;
-    } else {
-      rgb_image.convertTo(color, CV_8UC3);
-    }
-    if (color.rows != model_depth_.rows || color.cols != model_depth_.cols) {
-      cv::resize(color, color, model_depth_.size(), 0, 0, cv::INTER_LINEAR);
-    }
+  if (post_width_ <= 0 || post_height_ <= 0 || src_width_ <= 0 || src_height_ <= 0) {
+    return;
   }
 
-  // Scale intrinsics to model output resolution.
-  sensor_msgs::msg::CameraInfo cam_scaled = camera_info;
-  cam_scaled.k[0] = camera_info.k[0] * scale_x_;
-  cam_scaled.k[4] = camera_info.k[4] * scale_y_;
-  cam_scaled.k[2] = camera_info.k[2] * scale_x_;
-  cam_scaled.k[5] = camera_info.k[5] * scale_y_;
-  cam_scaled.width = model_depth_.cols;
-  cam_scaled.height = model_depth_.rows;
+  const int out_width = (post_width_ + downsample_factor - 1) / downsample_factor;
+  const int out_height = (post_height_ + downsample_factor - 1) / downsample_factor;
+  const size_t stride = colorize_point_cloud_ ? 15u : 12u;
+  const size_t total_bytes = static_cast<size_t>(out_width) * out_height * stride;
 
-  const std::string frame_id =
+  if (!point_cloud_d_ || point_capacity_bytes_ < total_bytes) {
+    point_cloud_d_ = cuda_utils::make_unique<uint8_t[]>(total_bytes);
+    point_cloud_h_ =
+      cuda_utils::make_unique_host<uint8_t[]>(total_bytes, cudaHostAllocDefault);
+    point_capacity_bytes_ = total_bytes;
+  }
+
+  const size_t model_pixels = static_cast<size_t>(post_width_) * post_height_;
+  if (colorize_point_cloud_) {
+    if (!color_model_d_) {
+      color_model_d_ = cuda_utils::make_unique<uint8_t[]>(model_pixels * 3);
+    }
+    launchResizeColor(
+      image_buf_d_.get(), src_width_, src_height_,
+      color_model_d_.get(), post_width_, post_height_, *stream_);
+  }
+
+  const double fx = camera_info.k[0] * scale_x_;
+  const double fy = camera_info.k[4] * scale_y_;
+  const double cx = camera_info.k[2] * scale_x_;
+  const double cy = camera_info.k[5] * scale_y_;
+
+  launchBuildPointCloud(
+    depth_scaled_d_.get(), sky_mask_d_.get(),
+    colorize_point_cloud_ ? color_model_d_.get() : nullptr,
+    post_width_, post_height_,
+    static_cast<float>(fx), static_cast<float>(fy),
+    static_cast<float>(cx), static_cast<float>(cy),
+    downsample_factor, colorize_point_cloud_,
+    point_cloud_d_.get(), out_width, out_height, *stream_);
+
+  point_cloud_.header.frame_id =
     camera_info.header.frame_id.empty() ? "camera_link" : camera_info.header.frame_id;
+  point_cloud_.height = out_height;
+  point_cloud_.width = out_width;
+  point_cloud_.is_dense = false;
+  point_cloud_.is_bigendian = false;
+  {
+    sensor_msgs::PointCloud2Modifier modifier(point_cloud_);
+    if (colorize_point_cloud_) {
+      modifier.setPointCloud2FieldsByString(2, "xyz", "rgb");
+    } else {
+      modifier.setPointCloud2FieldsByString(1, "xyz");
+    }
+  }
+  point_cloud_.data.resize(total_bytes);
 
-  depthImageToPointCloud(
-    model_depth_, cam_scaled, point_cloud_, frame_id, downsample_factor, color, sky_mask_);
+  CHECK_CUDA_ERROR(cudaMemcpyAsync(
+    point_cloud_h_.get(), point_cloud_d_.get(), total_bytes,
+    cudaMemcpyDeviceToHost, *stream_));
 
-  // Preserve original timestamp
   point_cloud_.header.stamp = camera_info.header.stamp;
 }
-const cv::Mat& TensorRTDepthAnything::getDepthImage() const
+
+const cv::Mat & TensorRTDepthAnything::getDepthImage() const
 {
   return depth_image_;
 }
 
-const sensor_msgs::msg::PointCloud2& TensorRTDepthAnything::getPointCloud() const
+const sensor_msgs::msg::PointCloud2 & TensorRTDepthAnything::getPointCloud() const
 {
   return point_cloud_;
 }
@@ -444,4 +454,4 @@ void TensorRTDepthAnything::printProfiling()
   trt_common_->printProfiling();
 }
 
-} // namespace depth_anything_v3
+}  // namespace depth_anything_v3
